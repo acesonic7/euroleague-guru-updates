@@ -13,10 +13,24 @@
 //   POST /api/tournament {action:'join',   id, name}   -> {ok} | {error:not_found|full|name_taken}
 //   POST /api/tournament {action:'submit', id, name, roster} -> {ok}
 
+// Resolve the Redis REST credentials no matter what prefix Vercel's Upstash
+// integration applied (KV_*, UPSTASH_REDIS_*, STORAGE_*, or any custom prefix).
+function envBySuffix(suffixes, excludes) {
+  for (const [k, v] of Object.entries(process.env)) {
+    if (!v) continue;
+    if (excludes && excludes.some((e) => k.includes(e))) continue;
+    if (suffixes.some((s) => k.endsWith(s))) return v;
+  }
+  return undefined;
+}
 const REST_URL =
-  process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+  process.env.KV_REST_API_URL ||
+  process.env.UPSTASH_REDIS_REST_URL ||
+  envBySuffix(['REST_API_URL', 'REDIS_REST_URL']);
 const REST_TOKEN =
-  process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+  process.env.KV_REST_API_TOKEN ||
+  process.env.UPSTASH_REDIS_REST_TOKEN ||
+  envBySuffix(['REST_API_TOKEN', 'REDIS_REST_TOKEN'], ['READ_ONLY']);
 const TTL_SECONDS = 60 * 60 * 24 * 30; // tournaments auto-expire after 30 days
 
 async function redis(command) {
