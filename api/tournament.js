@@ -15,6 +15,11 @@
 //   POST {action:'join',   id, name}        -> {ok} | {error:not_found|full|name_taken|locked}
 //   POST {action:'submit', id, name, roster}-> {ok, round}     (stores under the current round)
 //   POST {action:'next_round', id}          -> {ok, round}     (any member; locks membership)
+//
+// "Challenge the World" all-time ladder lives in ONE global hash `world:all`:
+//   field "<name>" -> {name, roster, submittedAt}   (one entry per name; resubmit replaces)
+//   GET  /api/tournament?world=1  -> {entries:[{name,roster,submittedAt}]}
+//   POST {action:'world_submit', name, roster} -> {ok}
 
 function envBySuffix(suffixes, excludes) {
   for (const [k, v] of Object.entries(process.env)) {
@@ -62,6 +67,12 @@ module.exports = async (req, res) => {
 
   try {
     if (req.method === 'GET') {
+      if (req.query.world) {
+        const flat = await redis(['HGETALL', 'world:all']);
+        const entries = [];
+        if (flat) for (let i = 0; i < flat.length; i += 2) { try { entries.push(JSON.parse(flat[i + 1])); } catch (e) {} }
+        return res.status(200).json({ entries });
+      }
       const id = req.query.id;
       if (!id) return res.status(400).json({ error: 'id_required' });
       const flat = await redis(['HGETALL', keyOf(id)]);
@@ -94,6 +105,11 @@ module.exports = async (req, res) => {
 
     if (req.method === 'POST') {
       const b = parseBody(req);
+      if (b.action === 'world_submit') {
+        if (!b.name) return res.status(400).json({ error: 'name_required' });
+        await redis(['HSET', 'world:all', b.name, JSON.stringify({ name: b.name, roster: b.roster, submittedAt: Date.now() })]);
+        return res.status(200).json({ ok: true });
+      }
       if (!b.id) return res.status(400).json({ error: 'id_required' });
       const key = keyOf(b.id);
 
