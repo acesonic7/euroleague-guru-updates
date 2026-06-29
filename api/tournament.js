@@ -33,6 +33,15 @@
 //   POST {action:'feedback_submit', name, msg, hp}  -> {ok}   (public; hp = honeypot, msg capped 1000)
 //   POST {action:'feedback_list',   key}            -> {items} (admin)
 //   POST {action:'feedback_delete', key, id} / {action:'feedback_clear', key} -> {ok} (admin)
+//   Sub-leagues = private/public mini-Worlds, ONE hash `league:<ID>` (field "meta", fields "t:<tid>" -> team).
+//   The all-time team ladder is computed client-side (everyone-vs-everyone), like the World. Public leagues
+//   are indexed in hash `leagues:pub` (field <ID> -> {id,name,teams,createdAt}) for the Browse directory.
+//   GET  ?leagues=1            -> {leagues:[{id,name,teams,createdAt}]}   (public directory, top 300)
+//   GET  ?league=<ID>          -> {meta:{id,name,visibility,owner}, entries:[{name,owner,label,teamId,roster}]} | null
+//   POST {action:'league_create', name, visibility, owner}        -> {ok, id}
+//   POST {action:'league_submit', id, owner, token, label, roster}-> {ok, teamId} | {error:owner_cap|league_full|not_found}
+//   POST {action:'league_delete_team', id, teamId, token|key}     -> {ok} | {error:forbidden}  (owner token or admin)
+//   POST {action:'league_delete', id, key}                        -> {ok} | {error:forbidden}  (admin: drop a league)
 
 function envBySuffix(suffixes, excludes) {
   for (const [k, v] of Object.entries(process.env)) {
@@ -114,6 +123,17 @@ async function worldRollover() { // lazy: when the calendar month changes, crown
   return cur;
 }
 
+// ---- Sub-leagues (private/public mini-Worlds, all-time team ladder) ----
+const lk = (id) => 'league:' + String(id).toUpperCase();
+const CODE_CH = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function newCode(n) { let s = ''; for (let i = 0; i < n; i++) s += CODE_CH[Math.floor(Math.random() * CODE_CH.length)]; return s; }
+const clean = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
+async function genLeagueId() { for (let i = 0; i < 20; i++) { const c = newCode(5); if (!(await redis(['EXISTS', lk(c)]))) return c; } return newCode(8); }
+async function readHash(key) { const flat = await redis(['HGETALL', key]); if (!flat || flat.length === 0) return null; const h = {}; for (let i = 0; i < flat.length; i += 2) h[flat[i]] = flat[i + 1]; return h; }
+async function pubSet(meta, teamsN) { // keep the public directory entry in sync (public leagues only)
+  if (meta.visibility === 'public') await redis(['HSET', 'leagues:pub', meta.id, JSON.stringify({ id: meta.id, name: meta.name, teams: teamsN, createdAt: meta.createdAt })]);
+}
+
 function parseBody(req) {
   if (req.body && typeof req.body === 'object') return req.body;
   try { return JSON.parse(req.body || '{}'); } catch { return {}; }
@@ -136,6 +156,23 @@ module.exports = async (req, res) => {
         if (cflat) for (let i = 0; i < cflat.length; i += 2) { try { champions.push(JSON.parse(cflat[i + 1])); } catch (e) {} }
         champions.sort((a, b) => String(b.month).localeCompare(String(a.month)));
         return res.status(200).json({ entries, month, champions });
+      }
+      if (req.query.leagues) { // public league directory (browse)
+        const flat = await redis(['HGETALL', 'leagues:pub']);
+        const leagues = [];
+        if (flat) for (let i = 0; i < flat.length; i += 2) { try { leagues.push(JSON.parse(flat[i + 1])); } catch (e) {} }
+        leagues.sort((a, b) => (b.teams || 0) - (a.teams || 0) || (b.createdAt || 0) - (a.createdAt || 0));
+        return res.status(200).json({ leagues: leagues.slice(0, 300) });
+      }
+      if (req.query.league) { // one league's all-time team ladder
+        const h = await readHash(lk(req.query.league));
+        if (!h || !h.meta) return res.status(200).json(null);
+        const meta = JSON.parse(h.meta);
+        const entries = Object.keys(h).filter((k) => k.startsWith('t:')).map((k) => {
+          const t = JSON.parse(h[k]);
+          return { name: t.label || t.owner || 'Team', owner: t.owner, label: t.label, teamId: t.teamId, roster: t.roster };
+        });
+        return res.status(200).json({ meta: { id: meta.id, name: meta.name, visibility: meta.visibility, owner: meta.owner }, entries });
       }
       const id = req.query.id;
       if (!id) return res.status(400).json({ error: 'id_required' });
@@ -218,6 +255,48 @@ module.exports = async (req, res) => {
       if (b.action === 'feedback_clear') { // admin only
         if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
         await redis(['DEL', 'feedback:all']);
+        return res.status(200).json({ ok: true });
+      }
+      if (b.action === 'league_create') { // create a public/private mini-World
+        const name = clean(b.name, 40);
+        if (!name) return res.status(400).json({ error: 'name_required' });
+        const id = await genLeagueId();
+        const meta = { id, name, visibility: b.visibility === 'public' ? 'public' : 'private', owner: clean(b.owner, 40), createdAt: Date.now() };
+        await redis(['HSET', lk(id), 'meta', JSON.stringify(meta)]);
+        await redis(['EXPIRE', lk(id), TTL_SECONDS]);
+        await pubSet(meta, 0);
+        return res.status(200).json({ ok: true, id });
+      }
+      if (b.action === 'league_submit') { // add a team to a league (cap 10/owner, 1000/league)
+        const h = await readHash(lk(b.id || ''));
+        if (!h || !h.meta) return res.status(404).json({ error: 'not_found' });
+        const meta = JSON.parse(h.meta);
+        const tks = Object.keys(h).filter((k) => k.startsWith('t:'));
+        if (tks.length >= 1000) return res.status(400).json({ error: 'league_full' });
+        const owner = clean(b.owner, 40);
+        if (owner && tks.filter((k) => { try { return JSON.parse(h[k]).owner === owner; } catch (e) { return false; } }).length >= 10)
+          return res.status(400).json({ error: 'owner_cap' });
+        const tid = `${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`;
+        await redis(['HSET', lk(b.id), 't:' + tid, JSON.stringify({ teamId: tid, owner, ownerToken: clean(b.token, 40), label: clean(b.label, 40), roster: b.roster, submittedAt: Date.now() })]);
+        await redis(['EXPIRE', lk(b.id), TTL_SECONDS]);
+        await pubSet(meta, tks.length + 1);
+        return res.status(200).json({ ok: true, teamId: tid });
+      }
+      if (b.action === 'league_delete_team') { // owner-token (or admin) may remove a team
+        const fld = 't:' + (b.teamId || '');
+        const raw = await redis(['HGET', lk(b.id || ''), fld]);
+        if (!raw) return res.status(200).json({ ok: true });
+        const isAdmin = ADMIN_KEY && b.key === ADMIN_KEY;
+        if (!isAdmin && JSON.parse(raw).ownerToken !== clean(b.token, 40)) return res.status(403).json({ error: 'forbidden' });
+        await redis(['HDEL', lk(b.id), fld]);
+        const metaRaw = await redis(['HGET', lk(b.id), 'meta']);
+        if (metaRaw) { const meta = JSON.parse(metaRaw); if (meta.visibility === 'public') { const keys = (await redis(['HKEYS', lk(b.id)])) || []; await pubSet(meta, keys.filter((k) => k.startsWith('t:')).length); } }
+        return res.status(200).json({ ok: true });
+      }
+      if (b.action === 'league_delete') { // admin: remove a whole league (moderation)
+        if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+        await redis(['DEL', lk(b.id || '')]);
+        await redis(['HDEL', 'leagues:pub', String(b.id || '').toUpperCase()]);
         return res.status(200).json({ ok: true });
       }
       if (!b.id) return res.status(400).json({ error: 'id_required' });
