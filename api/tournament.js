@@ -23,6 +23,9 @@
 //   field "<name>" -> {name, roster, submittedAt}   (one entry per name; resubmit replaces)
 //   GET  /api/tournament?world=1  -> {entries:[{name,roster,submittedAt}]}
 //   POST {action:'world_submit', name, roster} -> {ok}
+//   POST {action:'world_delete', key, name}    -> {ok} | {error:'forbidden'}   (admin: remove one squad)
+//   POST {action:'world_reset',  key}          -> {ok} | {error:'forbidden'}   (admin: clear the board)
+//        admin actions require key === process.env.ADMIN_KEY (set in Vercel; never in the client bundle)
 
 function envBySuffix(suffixes, excludes) {
   for (const [k, v] of Object.entries(process.env)) {
@@ -41,6 +44,7 @@ const REST_TOKEN =
   process.env.UPSTASH_REDIS_REST_TOKEN ||
   envBySuffix(['REST_API_TOKEN', 'REDIS_REST_TOKEN'], ['READ_ONLY']);
 const TTL_SECONDS = 60 * 60 * 24 * 30; // auto-expire after 30 days of inactivity
+const ADMIN_KEY = process.env.ADMIN_KEY; // set in Vercel env; gates world moderation (delete/reset)
 
 async function redis(command) {
   const r = await fetch(REST_URL, {
@@ -111,6 +115,17 @@ module.exports = async (req, res) => {
       if (b.action === 'world_submit') {
         if (!b.name) return res.status(400).json({ error: 'name_required' });
         await redis(['HSET', 'world:all', b.name, JSON.stringify({ name: b.name, roster: b.roster, submittedAt: Date.now() })]);
+        return res.status(200).json({ ok: true });
+      }
+      if (b.action === 'world_delete') { // moderation: remove one squad (admin only)
+        if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+        if (!b.name) return res.status(400).json({ error: 'name_required' });
+        await redis(['HDEL', 'world:all', b.name]);
+        return res.status(200).json({ ok: true });
+      }
+      if (b.action === 'world_reset') { // moderation: clear the whole board (admin only)
+        if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+        await redis(['DEL', 'world:all']);
         return res.status(200).json({ ok: true });
       }
       if (!b.id) return res.status(400).json({ error: 'id_required' });
