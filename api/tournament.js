@@ -21,7 +21,10 @@
 //
 // "Challenge the World" all-time ladder lives in ONE global hash `world:all`:
 //   field "<name>" -> {name, roster, submittedAt}   (one entry per name; resubmit replaces)
-//   GET  /api/tournament?world=1  -> {entries:[{name,roster,submittedAt}]}
+//   GET  /api/tournament?world=1  -> {entries:[...], month:'YYYY-MM', champions:[{month,name,w,l,roster,at}]}
+//        Monthly seasons: on a calendar-month change the previous month's leader is crowned into
+//        `world:champions` (hash by month) and `world:all` is reset (lazy, on first GET/submit of the new month).
+//   POST {action:'world_endmonth', key} -> {ok, crowned}  (admin: crown the current leader + reset now)
 //   POST {action:'world_submit', name, roster} -> {ok}
 //   POST {action:'world_delete', key, name}    -> {ok} | {error:'forbidden'}   (admin: remove one squad)
 //   POST {action:'world_reset',  key}          -> {ok} | {error:'forbidden'}   (admin: clear the board)
@@ -64,6 +67,53 @@ const keyOf = (id) => `tourn:${String(id).toUpperCase()}`;
 const pf = (name) => `p:${name}`;
 const rf = (round, name) => `r${round}:${name}`;
 
+// ---- Challenge-the-World monthly seasons ----
+function monthKey() { const d = new Date(); return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`; }
+function _wprof(e) { // reduce an entry to category sums (rounded) + shooter eFG + team eFG, like the client
+  const v = [0, 0, 0, 0, 0, 0]; let ts = 0, sh = null;
+  (e.roster || []).forEach((p) => { if (!p) return; v[0] += p.ppg; v[1] += p.rpg; v[2] += p.apg; v[3] += p.spg; v[4] += p.bpg; v[5] += p.tpg; ts += (+p.efg || 0); if (p._shooter) sh = (+p.efg || 0); });
+  for (let k = 0; k < 6; k++) v[k] = Math.round(v[k] * 10) / 10;
+  return { name: e.name, roster: e.roster, v, ts, sh, w: 0, l: 0 };
+}
+function _wcmp(a, b) {
+  let wa = 0, wb = 0;
+  for (let k = 0; k < 6; k++) { const x = a.v[k], y = b.v[k]; if (k === 5) { if (x < y) wa++; else if (y < x) wb++; } else { if (x > y) wa++; else if (y > x) wb++; } }
+  if (wa > wb) return 0; if (wb > wa) return 1;
+  if (a.sh != null && b.sh != null) return a.sh >= b.sh ? 0 : 1;
+  return a.ts >= b.ts ? 0 : 1;
+}
+function worldWinner(entries) {
+  const b = entries.filter((e) => e.roster).map(_wprof); const n = b.length;
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) { if (i === j) continue; if (_wcmp(b[i], b[j]) === 0) b[i].w++; else b[i].l++; }
+  b.forEach((x) => { const g = x.w + x.l; x.pct = g ? x.w / g : 0; });
+  b.sort((p, q) => q.pct - p.pct || q.w - p.w || String(p.name).localeCompare(String(q.name)));
+  return b[0] || null;
+}
+async function worldEntries() {
+  const flat = await redis(['HGETALL', 'world:all']); const out = [];
+  if (flat) for (let i = 0; i < flat.length; i += 2) { try { out.push(JSON.parse(flat[i + 1])); } catch (e) {} }
+  return out;
+}
+async function crownIfNew(month) { // record the winner of `month` from the current board (HSETNX -> once)
+  const entries = await worldEntries();
+  if (entries.length < 2) return null;
+  const win = worldWinner(entries);
+  if (!win) return null;
+  const added = await redis(['HSETNX', 'world:champions', month, JSON.stringify({ month, name: win.name, w: win.w, l: win.l, roster: win.roster, at: Date.now() })]);
+  return added ? win.name : null;
+}
+async function worldRollover() { // lazy: when the calendar month changes, crown last month + reset
+  const cur = monthKey();
+  const m = await redis(['HGET', 'world:meta', 'm']);
+  if (!m) { await redis(['HSET', 'world:meta', 'm', cur]); return cur; }
+  if (m === cur) return cur;
+  await crownIfNew(m);
+  await redis(['DEL', 'world:all']);
+  await redis(['HSET', 'world:meta', 'm', cur]);
+  await redis(['EXPIRE', 'world:champions', TTL_SECONDS * 12]);
+  return cur;
+}
+
 function parseBody(req) {
   if (req.body && typeof req.body === 'object') return req.body;
   try { return JSON.parse(req.body || '{}'); } catch { return {}; }
@@ -79,10 +129,13 @@ module.exports = async (req, res) => {
   try {
     if (req.method === 'GET') {
       if (req.query.world) {
-        const flat = await redis(['HGETALL', 'world:all']);
-        const entries = [];
-        if (flat) for (let i = 0; i < flat.length; i += 2) { try { entries.push(JSON.parse(flat[i + 1])); } catch (e) {} }
-        return res.status(200).json({ entries });
+        const month = await worldRollover();
+        const entries = await worldEntries();
+        const cflat = await redis(['HGETALL', 'world:champions']);
+        const champions = [];
+        if (cflat) for (let i = 0; i < cflat.length; i += 2) { try { champions.push(JSON.parse(cflat[i + 1])); } catch (e) {} }
+        champions.sort((a, b) => String(b.month).localeCompare(String(a.month)));
+        return res.status(200).json({ entries, month, champions });
       }
       const id = req.query.id;
       if (!id) return res.status(400).json({ error: 'id_required' });
@@ -118,8 +171,16 @@ module.exports = async (req, res) => {
       const b = parseBody(req);
       if (b.action === 'world_submit') {
         if (!b.name) return res.status(400).json({ error: 'name_required' });
+        await worldRollover(); // start a fresh month if the calendar month changed
         await redis(['HSET', 'world:all', b.name, JSON.stringify({ name: b.name, roster: b.roster, submittedAt: Date.now() })]);
         return res.status(200).json({ ok: true });
+      }
+      if (b.action === 'world_endmonth') { // admin: crown the current leader now + start a fresh month
+        if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+        const cur = (await redis(['HGET', 'world:meta', 'm'])) || monthKey();
+        const crowned = await crownIfNew(cur);
+        await redis(['DEL', 'world:all']);
+        return res.status(200).json({ ok: true, crowned });
       }
       if (b.action === 'world_delete') { // moderation: remove one squad (admin only)
         if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
