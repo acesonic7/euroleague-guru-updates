@@ -26,6 +26,10 @@
 //   POST {action:'world_delete', key, name}    -> {ok} | {error:'forbidden'}   (admin: remove one squad)
 //   POST {action:'world_reset',  key}          -> {ok} | {error:'forbidden'}   (admin: clear the board)
 //        admin actions require key === process.env.ADMIN_KEY (set in Vercel; never in the client bundle)
+//   Feedback messages live in ONE global hash `feedback:all` (field <id> -> {id,name,msg,at}):
+//   POST {action:'feedback_submit', name, msg, hp}  -> {ok}   (public; hp = honeypot, msg capped 1000)
+//   POST {action:'feedback_list',   key}            -> {items} (admin)
+//   POST {action:'feedback_delete', key, id} / {action:'feedback_clear', key} -> {ok} (admin)
 
 function envBySuffix(suffixes, excludes) {
   for (const [k, v] of Object.entries(process.env)) {
@@ -126,6 +130,33 @@ module.exports = async (req, res) => {
       if (b.action === 'world_reset') { // moderation: clear the whole board (admin only)
         if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
         await redis(['DEL', 'world:all']);
+        return res.status(200).json({ ok: true });
+      }
+
+      if (b.action === 'feedback_submit') { // public: store a message (honeypot + length cap vs spam)
+        const msg = String(b.msg || '').trim().slice(0, 1000);
+        if (!msg || b.hp) return res.status(200).json({ ok: true }); // empty or bot -> silently accept
+        const id = `${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`;
+        await redis(['HSET', 'feedback:all', id, JSON.stringify({ id, name: String(b.name || '').trim().slice(0, 40), msg, at: Date.now() })]);
+        await redis(['EXPIRE', 'feedback:all', TTL_SECONDS]);
+        return res.status(200).json({ ok: true });
+      }
+      if (b.action === 'feedback_list') { // admin only
+        if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+        const flat = await redis(['HGETALL', 'feedback:all']);
+        const items = [];
+        if (flat) for (let i = 0; i < flat.length; i += 2) { try { items.push(JSON.parse(flat[i + 1])); } catch (e) {} }
+        items.sort((a, b2) => (b2.at || 0) - (a.at || 0));
+        return res.status(200).json({ items });
+      }
+      if (b.action === 'feedback_delete') { // admin only
+        if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+        if (b.id) await redis(['HDEL', 'feedback:all', b.id]);
+        return res.status(200).json({ ok: true });
+      }
+      if (b.action === 'feedback_clear') { // admin only
+        if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+        await redis(['DEL', 'feedback:all']);
         return res.status(200).json({ ok: true });
       }
       if (!b.id) return res.status(400).json({ error: 'id_required' });
