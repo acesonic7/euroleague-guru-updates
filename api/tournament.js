@@ -210,6 +210,7 @@ module.exports = async (req, res) => {
         if (!b.name) return res.status(400).json({ error: 'name_required' });
         await worldRollover(); // start a fresh month if the calendar month changed
         await redis(['HSET', 'world:all', b.name, JSON.stringify({ name: b.name, roster: b.roster, submittedAt: Date.now() })]);
+        await redis(['INCR', 'stats:squads']);
         return res.status(200).json({ ok: true });
       }
       if (b.action === 'world_endmonth') { // admin: crown the current leader now + start a fresh month
@@ -229,6 +230,23 @@ module.exports = async (req, res) => {
         if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
         await redis(['DEL', 'world:all']);
         return res.status(200).json({ ok: true });
+      }
+
+      if (b.action === 'stats') { // admin: engagement metrics (all-time counters + current snapshot)
+        if (!ADMIN_KEY || b.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+        const getn = async (k) => Number(await redis(['GET', k])) || 0;
+        const hlen = async (k) => Number(await redis(['HLEN', k])) || 0;
+        const allTime = {
+          squads: await getn('stats:squads'), leagues: await getn('stats:leagues'),
+          leagueTeams: await getn('stats:league_teams'), tournaments: await getn('stats:tournaments'),
+        };
+        const cflat = await redis(['HGETALL', 'leagues:pub']); let publicTeams = 0;
+        if (cflat) for (let i = 1; i < cflat.length; i += 2) { try { publicTeams += JSON.parse(cflat[i]).teams || 0; } catch (e) {} }
+        const now = {
+          ladderSquads: await hlen('world:all'), champions: await hlen('world:champions'),
+          publicLeagues: await hlen('leagues:pub'), publicTeams, feedback: await hlen('feedback:all'),
+        };
+        return res.status(200).json({ allTime, now });
       }
 
       if (b.action === 'feedback_submit') { // public: store a message (honeypot + length cap vs spam)
@@ -265,6 +283,7 @@ module.exports = async (req, res) => {
         await redis(['HSET', lk(id), 'meta', JSON.stringify(meta)]);
         await redis(['EXPIRE', lk(id), TTL_SECONDS]);
         await pubSet(meta, 0);
+        await redis(['INCR', 'stats:leagues']);
         return res.status(200).json({ ok: true, id });
       }
       if (b.action === 'league_submit') { // add a team to a league (cap 10/owner, 1000/league)
@@ -283,6 +302,7 @@ module.exports = async (req, res) => {
         await redis(['HSET', lk(b.id), 't:' + tid, JSON.stringify({ teamId: tid, owner, ownerToken: clean(b.token, 40), label, roster: b.roster, submittedAt: Date.now() })]);
         await redis(['EXPIRE', lk(b.id), TTL_SECONDS]);
         await pubSet(meta, tks.length + 1);
+        await redis(['INCR', 'stats:league_teams']);
         return res.status(200).json({ ok: true, teamId: tid });
       }
       if (b.action === 'league_delete_team') { // owner-token (or admin) may remove a team
@@ -309,6 +329,7 @@ module.exports = async (req, res) => {
         const meta = JSON.stringify({ maxPlayers: Number(b.maxPlayers) || 2, createdAt: Date.now(), round: 1 });
         await redis(['HSET', key, 'meta', meta, pf(b.name), JSON.stringify({ name: b.name, joinedAt: Date.now() })]);
         await redis(['EXPIRE', key, TTL_SECONDS]);
+        await redis(['INCR', 'stats:tournaments']);
         return res.status(200).json({ ok: true, round: 1 });
       }
 
