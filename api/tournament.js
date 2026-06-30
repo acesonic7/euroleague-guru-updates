@@ -276,8 +276,11 @@ module.exports = async (req, res) => {
         const owner = clean(b.owner, 40);
         if (owner && tks.filter((k) => { try { return JSON.parse(h[k]).owner === owner; } catch (e) { return false; } }).length >= 10)
           return res.status(400).json({ error: 'owner_cap' });
+        const label = clean(b.label, 40);
+        if (label && tks.some((k) => { try { return (JSON.parse(h[k]).label || '').toLowerCase() === label.toLowerCase(); } catch (e) { return false; } }))
+          return res.status(400).json({ error: 'name_taken' });
         const tid = `${Date.now()}-${Math.floor(Math.random() * 9000 + 1000)}`;
-        await redis(['HSET', lk(b.id), 't:' + tid, JSON.stringify({ teamId: tid, owner, ownerToken: clean(b.token, 40), label: clean(b.label, 40), roster: b.roster, submittedAt: Date.now() })]);
+        await redis(['HSET', lk(b.id), 't:' + tid, JSON.stringify({ teamId: tid, owner, ownerToken: clean(b.token, 40), label, roster: b.roster, submittedAt: Date.now() })]);
         await redis(['EXPIRE', lk(b.id), TTL_SECONDS]);
         await pubSet(meta, tks.length + 1);
         return res.status(200).json({ ok: true, teamId: tid });
