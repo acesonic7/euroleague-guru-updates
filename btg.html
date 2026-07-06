@@ -100,7 +100,6 @@ h1,h2,.bebas{font-family:'Bebas Neue',sans-serif;letter-spacing:1px;}
     <div class="theme-sub" style="margin-bottom:12px">Beat the Guru in each challenge to unlock the next. Every loss counts — forever.</div>
     <div class="gmap" id="gmap"></div>
     <div id="map-pantheon"></div>
-    <div style="margin-top:14px"><button class="btn ghost" onclick="resetAll()">RESET LOCAL PROGRESS</button></div>
   </div>
 
   <div class="card hidden" id="scr-intro">
@@ -227,7 +226,6 @@ function loadPantheon(){
   }).catch(()=>{});
 }
 function paintLosses(){document.getElementById('losses').textContent=S().losses;}
-function resetAll(){localStorage.removeItem(skey());ATT={};showMap();paintLosses();}
 let CUR=0, G={}, ATT={};
 
 /* ===== pools ===== */
